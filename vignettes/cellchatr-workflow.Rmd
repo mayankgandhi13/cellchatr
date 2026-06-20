@@ -12,14 +12,13 @@ knitr::opts_chunk$set(
   collapse = TRUE,
   comment = "#>"
 )
-cellchat_available <- requireNamespace("CellChat", quietly = TRUE)
 ```
 
 ## Overview
 
 `cellchatr` accelerates three bottleneck steps in the CellChat workflow 
 using Rust via extendr. This vignette shows a complete pipeline using 
-real `CellChatDB.human` data.
+synthetic ligand-receptor data representative of a CellChat-style database.
 
 The three functions replace:
 
@@ -33,61 +32,71 @@ The three functions replace:
 
 ```{r setup}
 library(cellchatr)
-if (requireNamespace("CellChat", quietly = TRUE)) {
-  library(CellChat)
-} else {
-  message("CellChat not installed. Install with: devtools::install_github('jinworks/CellChat')")
-}
 ```
 
-## Step 1 — Load CellChatDB
+## Synthetic Ligand-Receptor Database
 
-```{r load-db, eval=cellchat_available}
-db <- CellChatDB.human
+We construct a small synthetic L-R database representative of a 
+CellChat-style interaction table. In practice, users can supply 
+their own L-R database in the same format.
 
-cat("Total L-R interactions:", nrow(db$interaction), "\n")
-cat("Signaling pathways:", length(unique(db$interaction$pathway_name)), "\n")
+```{r build-db}
+set.seed(42)
 
-head(db$interaction[, c("interaction_name", "ligand", "receptor", "pathway_name")])
+ligands   <- c("TGFB1", "VEGFA", "CXCL12", "IL6", "TNF",
+               "MIF",   "CCL2",  "PDGFB",  "EGF", "FGF2")
+receptors <- c("TGFBR1", "FLT1",   "CXCR4", "IL6R",  "TNFRSF1A",
+               "CD74",   "CCR2",   "PDGFRB", "EGFR",  "FGFR1")
+pathways  <- c("TGFb", "VEGF", "CXCL", "IL6", "TNF",
+               "MIF",  "CCL",  "PDGF", "EGF", "FGF")
+
+db <- data.frame(
+  interaction_name = paste0(ligands, "_", receptors),
+  ligand           = ligands,
+  receptor         = receptors,
+  pathway_name     = pathways,
+  stringsAsFactors = FALSE
+)
+
+cat("Total L-R interactions:", nrow(db), "\n")
+cat("Signaling pathways:", length(unique(db$pathway_name)), "\n")
+head(db)
 ```
 
-## Step 2 — Subset Expression Genes to CellChatDB (`rust_subset_genes`)
+## Step 1 — Subset Expression Genes to Database (`rust_subset_genes`)
 
-In a real experiment you would use your scRNA-seq gene names here.
-We simulate 15,000 genes with real CellChatDB genes embedded.
-
-```{r subset-genes, eval=cellchat_available}
+```{r subset-genes}
 expr_genes <- unique(c(
   paste0("GENE", 1:14000),
-  db$interaction$ligand,
-  db$interaction$receptor
+  db$ligand,
+  db$receptor
 ))
 cat("Total genes in expression matrix:", length(expr_genes), "\n")
 
-db_genes <- unique(c(db$interaction$ligand, db$interaction$receptor))
-cat("Genes in CellChatDB:", length(db_genes), "\n")
+db_genes <- unique(c(db$ligand, db$receptor))
+cat("Genes in L-R database:", length(db_genes), "\n")
 
 subset_genes <- rust_subset_genes(expr_genes, db_genes)
 cat("Genes present in both:", length(subset_genes), "\n")
 head(subset_genes)
 ```
 
-## Step 3 — Identify Overexpressed Genes (`rust_wilcoxon_filter`)
+## Step 2 — Identify Overexpressed Genes (`rust_wilcoxon_filter`)
 
 Parallel Wilcoxon rank-sum test across all genes and cell types.
 Uses Rayon for multi-core parallelism — 183x faster than base R.
 
-```{r wilcoxon-filter, eval=cellchat_available}
+```{r wilcoxon-filter}
 set.seed(42)
 
 n_genes <- length(subset_genes)
 n_cells <- 300
-labels  <- c(rep("Fibroblast", 100), rep("Macrophage", 100), 
+labels  <- c(rep("Fibroblast", 100), rep("Macrophage", 100),
              rep("Endothelial", 100))
 
 counts <- matrix(rnorm(n_genes * n_cells, mean = 1, sd = 1), nrow = n_genes)
-counts[1:20, labels == "Fibroblast"] <- 
-  counts[1:20, labels == "Fibroblast"] + 5
+counts[1:5, labels == "Fibroblast"] <-
+  counts[1:5, labels == "Fibroblast"] + 5
 
 overexpressed <- rust_wilcoxon_filter(counts, labels, subset_genes, 0.05)
 
@@ -95,26 +104,23 @@ cat("Overexpressed genes found:", length(overexpressed), "\n")
 head(overexpressed)
 ```
 
-## Step 4 — Match to L-R Pairs (`rust_match_lr_pairs`)
+## Step 3 — Match to L-R Pairs (`rust_match_lr_pairs`)
 
 HashSet-based matching — O(m + r) vs R's O(m × r).
 
-```{r match-lr, eval=cellchat_available}
+```{r match-lr}
 interactions <- rust_match_lr_pairs(
   overexpressed = overexpressed,
-  lr_ligands    = db$interaction$ligand,
-  lr_receptors  = db$interaction$receptor,
-  lr_names      = db$interaction$interaction_name
+  lr_ligands    = db$ligand,
+  lr_receptors  = db$receptor,
+  lr_names      = db$interaction_name
 )
 
 cat("Matched L-R interactions:", length(interactions), "\n")
 
-matched <- db$interaction[
-  db$interaction$interaction_name %in% interactions,
-  c("interaction_name", "ligand", "receptor", "pathway_name")
-]
-
-sort(table(matched$pathway_name), decreasing = TRUE)[1:10]
+matched <- db[db$interaction_name %in% interactions,
+              c("interaction_name", "ligand", "receptor", "pathway_name")]
+print(matched)
 ```
 
 ## Benchmark
@@ -123,9 +129,9 @@ sort(table(matched$pathway_name), decreasing = TRUE)[1:10]
 library(microbenchmark)
 
 set.seed(42)
-n_genes   <- 2000
-n_cells   <- 200
-labels_bm <- c(rep("A", 100), rep("B", 100))
+n_genes    <- 2000
+n_cells    <- 200
+labels_bm  <- c(rep("A", 100), rep("B", 100))
 gene_names <- paste0("GENE", 1:n_genes)
 counts_bm  <- matrix(rnorm(n_genes * n_cells), nrow = n_genes)
 
